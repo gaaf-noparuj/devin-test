@@ -3,6 +3,12 @@ import type { Patient, Stage } from './types'
 import { nextStage, previousStage } from './types'
 
 const STORAGE_KEY = 'clinic-flow.patients.v1'
+const COUNTERS_KEY = 'clinic-flow.counters.v1'
+
+interface Counters {
+  hn: number
+  queue: number
+}
 
 function load(): Patient[] {
   try {
@@ -11,6 +17,27 @@ function load(): Patient[] {
   } catch {
     return []
   }
+}
+
+function loadCounters(): Counters {
+  try {
+    const raw = localStorage.getItem(COUNTERS_KEY)
+    if (raw) return JSON.parse(raw) as Counters
+  } catch {
+    // fall through to deriving from stored patients
+  }
+  const patients = load()
+  return {
+    hn: patients.reduce((max, p) => Math.max(max, Number(p.hn.match(/\d+$/)?.[0] ?? 0)), 0),
+    queue: patients.reduce((max, p) => Math.max(max, p.queueNumber ?? 0), 0),
+  }
+}
+
+function takeNumber(field: keyof Counters): number {
+  const counters = loadCounters()
+  const next = counters[field] + 1
+  localStorage.setItem(COUNTERS_KEY, JSON.stringify({ ...counters, [field]: next }))
+  return next
 }
 
 export interface NewPatient {
@@ -30,11 +57,12 @@ export function usePatients() {
 
   const register = useCallback((input: NewPatient) => {
     const now = new Date().toISOString()
+    const hn = input.hn.trim() || `HN-${String(takeNumber('hn')).padStart(4, '0')}`
     setPatients((current) => [
       ...current,
       {
         id: crypto.randomUUID(),
-        hn: input.hn.trim() || `HN-${String(current.length + 1).padStart(4, '0')}`,
+        hn,
         name: input.name.trim(),
         phone: input.phone.trim(),
         birthDate: input.birthDate,
@@ -49,23 +77,25 @@ export function usePatients() {
   }, [])
 
   const advance = useCallback((id: string, payload?: { amountDue?: number; amountPaid?: number }) => {
-    setPatients((current) => {
-      const nextQueueNumber =
-        current.reduce((max, p) => Math.max(max, p.queueNumber ?? 0), 0) + 1
-      return current.map((patient) => {
+    let assignedQueueNumber: number | null = null
+    setPatients((current) =>
+      current.map((patient) => {
         if (patient.id !== id) return patient
         const target = nextStage(patient.stage)
         if (!target) return patient
         return {
           ...patient,
           stage: target,
-          queueNumber: target === 'in_queue' ? nextQueueNumber : patient.queueNumber,
+          queueNumber:
+            target === 'in_queue' && patient.queueNumber === null
+              ? (assignedQueueNumber ??= takeNumber('queue'))
+              : patient.queueNumber,
           amountDue: payload?.amountDue ?? patient.amountDue,
           amountPaid: target === 'checked_out' ? payload?.amountPaid ?? patient.amountDue : patient.amountPaid,
           history: [...patient.history, { stage: target, at: new Date().toISOString() }],
         }
-      })
-    })
+      }),
+    )
   }, [])
 
   const sendBack = useCallback((id: string) => {
